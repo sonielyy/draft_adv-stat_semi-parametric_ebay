@@ -1,0 +1,350 @@
+---
+title: "Xbox eBay Auction Analysis: Semiparametric Regression"
+date: "2026-05-24"
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+# 1. Load Libraries & Data
+
+```{r load}
+library(tidyverse)
+library(scales)
+library(knitr)
+
+# Load the dataset
+df <- read.csv("Xbox_7-day_auctions.csv", stringsAsFactors = FALSE)
+
+# Check the data
+glimpse(df)
+```
+
+# 2. Basic Distributions
+
+## 2.1 How Many Unique Auctions?
+
+```{r unique_auctions}
+n_auctions <- n_distinct(df$auctionid)
+cat("Total unique auctions:", n_auctions, "\n")
+cat("Total bid records   :", nrow(df), "\n")
+```
+
+## 2.2 Price & Opening Bid per Auction
+
+```{r price_openbid}
+# Each auction has a fixed price and openbid, so we collapse to one row per auction
+auction_level <- df %>%
+  group_by(auctionid) %>%
+  summarise(
+    openbid = first(openbid),
+    price   = first(price),
+    .groups = "drop"
+  )
+
+kable(auction_level, caption = "Closing Price & Opening Bid per Auction")
+```
+
+```{r price_openbid_plot}
+# Price vs opening bid scatter
+auction_level %>%
+  ggplot(aes(x = openbid, y = price)) +
+  geom_point(size = 3, colour = "#2c7bb6", alpha = 0.8) +
+  geom_abline(linetype = "dashed", colour = "grey50") +  # 45° reference line
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title    = "Closing Price vs Opening Bid by Auction",
+    subtitle = "Dashed line = price equals opening bid",
+    x        = "Opening Bid ($)",
+    y        = "Closing Price ($)"
+  ) +
+  theme_minimal()
+```
+
+## 2.3 Bids per Auction
+
+```{r bids_per_auction}
+bids_per_auction <- df %>%
+  group_by(auctionid) %>%
+  summarise(n_bids = n(), .groups = "drop")
+
+mean_bids <- mean(bids_per_auction$n_bids)
+
+bids_per_auction %>%
+  ggplot(aes(x = factor(auctionid), y = n_bids)) +
+  geom_col(fill = "#2c7bb6", alpha = 0.8) +
+  geom_hline(yintercept = mean_bids, color = "grey40", linetype = "solid", size = 1) +
+  labs(
+    title = "Number of Bids per Auction",
+    x     = "Auction ID",
+    y     = "Number of Bids"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+```
+
+## 2.4 Bid Amounts
+
+```{r bid_distribution}
+summary(df$bid)
+
+df %>%
+  ggplot(aes(x = bid)) +
+  geom_histogram(bins = 40, fill = "#2c7bb6", colour = "white", alpha = 0.85) +
+  scale_x_continuous(labels = dollar) +
+  labs(
+    title = "Distribution of All Proxy Bids",
+    x     = "Bid Amount ($)",
+    y     = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 2.5 Bid Timing — Days or Hours?
+
+```{r bidtime_unit_check}
+# bidtime is measured in DAYS from auction start (range 0–7)
+
+cat("bidtime range (days):", range(df$bidtime), "\n")
+
+# Create hours column for readability
+df <- df %>%
+  mutate(bidtime_hours = bidtime * 24)
+
+cat("bidtime range (hours):", round(range(df$bidtime_hours), 1), "\n")
+```
+
+> We will keep the `bidtime` in **days** for modelling (natural scale of a 7-day auction),
+> but plot in **hours** so patterns within a day are visible.
+
+```{r bidtime_plot}
+df %>%
+  ggplot(aes(x = bidtime_hours)) +
+  geom_histogram(bins = 60, fill = "#d7191c", colour = "white", alpha = 0.85) +
+  scale_x_continuous(breaks = seq(0, 168, 24),
+                     labels = paste0(seq(0, 7), "d")) +
+  labs(
+    title    = "When Are Bids Placed? (All Auctions)",
+    subtitle = "x-axis labels show elapsed days; bars are ~2.8-hour bins",
+    x        = "Time Since Auction Start (hours)",
+    y        = "Number of Bids"
+  ) +
+  theme_minimal()
+```
+
+```{r bidtime_plot_by_auction}
+df %>%
+  ggplot(aes(x = bidtime_hours, fill = factor(auctionid))) +
+  geom_histogram(bins = 60, colour = "white", alpha = 0.85, position = "stack") +
+  scale_x_continuous(
+    breaks = seq(0, 168, 24),
+    labels = paste0(seq(0, 7), "d")
+  ) +
+  labs(
+    title    = "When Are Bids Placed? (Stacked by Auction)",
+    subtitle = "x-axis labels show elapsed days; bars are ~2.8-hour bins",
+    x        = "Time Since Auction Start (hours)",
+    y        = "Number of Bids"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+## 2.6 Bidder Rating Distribution
+
+```{r bidderrate}
+summary(df$bidderrate)
+
+df %>%
+  ggplot(aes(x = bidderrate)) +
+  geom_histogram(bins = 40, fill = "#1a9641", colour = "white", alpha = 0.85) +
+  scale_x_log10(labels = comma) +   # log scale because of extreme outliers
+  labs(
+    title    = "Distribution of Bidder Feedback Ratings (log scale)",
+    subtitle = "Many new bidders (rating = 0); a few highly experienced buyers",
+    x        = "Bidder Rating (log10)",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 2.7 Number of Unique Bidders per Auction
+
+```{r unique_bidders}
+bidders_per_auction <- df %>%
+  group_by(auctionid) %>%
+  summarise(n_bidders = n_distinct(bidder), .groups = "drop")
+
+mean_bidders <- mean(bidders_per_auction$n_bidders)
+
+bidders_per_auction %>%
+  ggplot(aes(x = factor(auctionid), y = n_bidders)) +
+  geom_col(fill = "#756bb1", alpha = 0.85) +
+  geom_hline(
+    yintercept = mean_bidders,
+    color = "grey40",
+    linetype = "solid",
+    size = 0.6   # daha ince çizgi
+  ) +
+  labs(
+    title = "Number of Unique Bidders per Auction",
+    x     = "Auction ID",
+    y     = "Unique Bidders"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+```
+
+
+# 3. Exploratory Data Analysis (EDA)
+
+## 3.1 Unique Bidders, How Many Auction They Bid
+
+```{r bidder_participation}
+# How many unique bidders are there across all auctions?
+n_unique_bidders <- n_distinct(df$bidder)
+cat("Total unique bidders across all auctions:", n_unique_bidders, "\n")
+
+# Count how many auctions each bidder participated in
+bidder_participation <- df %>%
+  group_by(bidder) %>%
+  summarise(n_auctions = n_distinct(auctionid), .groups = "drop")
+
+# Distribution: how many bidders participated in exactly 1, 2, 3... auctions
+bidder_participation %>%
+  count(n_auctions) %>%
+  ggplot(aes(x = factor(n_auctions), y = n)) +
+  geom_col(fill = "#2c7bb6", alpha = 0.85) +
+  geom_text(aes(label = n), vjust = -0.5, size = 3.5) +
+  labs(
+    title    = "Bidder Participation Across Auctions",
+    subtitle = paste("Total unique bidders:", n_unique_bidders),
+    x        = "Number of Auctions Participated",
+    y        = "Number of Bidders"
+  ) +
+  theme_minimal()
+```
+
+
+
+## 3.2 Bid Escalation — How Fast Do Bids Rise?
+
+```{r bid_escalation}
+# Show bid trajectory for a sample auction (most bids = most interesting)
+top_auction <- bids_per_auction %>% slice_max(n_bids, n = 1) %>% pull(auctionid)
+
+df %>%
+  filter(auctionid == top_auction) %>%
+  arrange(bidtime) %>%
+  ggplot(aes(x = bidtime, y = bid, colour = bidder)) +
+  geom_step(colour = "grey70") +
+  geom_point(size = 2.5) +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title   = paste0("Bid Escalation — Auction ", top_auction),
+    x       = "Time (days from auction start)",
+    y       = "Proxy Bid ($)",
+    colour  = "Bidder"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7))
+```
+
+## 3.3 Bidder Experience vs Bid Amount
+
+```{r experience_vs_bid}
+# Does a higher feedback rating lead to higher bids?
+df %>%
+  filter(bidderrate > 0) %>%   # exclude zero-rating bidders for log scale
+  ggplot(aes(x = bidderrate, y = bid)) +
+  geom_point(alpha = 0.3, colour = "#2c7bb6") +
+  geom_smooth(method = "lm", colour = "#d7191c", se = TRUE) +
+  scale_x_log10(labels = comma) +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title    = "Bidder Rating vs Proxy Bid Amount",
+    subtitle = "x-axis on log scale; OLS trend line with 95% CI",
+    x        = "Bidder Feedback Rating (log10)",
+    y        = "Proxy Bid ($)"
+  ) +
+  theme_minimal()
+```
+
+## 3.4 Price Markup Over Opening Bid
+
+```{r markup}
+auction_level <- auction_level %>%
+  mutate(
+    markup_abs = price - openbid,
+    markup_pct_of_price = (price - openbid) / price * 100
+  )
+
+summary(auction_level %>% select(markup_abs, markup_pct_of_price))
+
+auction_level %>%
+  ggplot(aes(x = markup_pct_of_price)) +
+  geom_histogram(bins = 20, fill = "#fc8d59", colour = "white", alpha = 0.85) +
+  labs(
+    title = "Closing Price Markup Over Opening Bid (%)",
+    x     = "Markup (%)",
+    y     = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+## 3.8 Correlation Matrix (Numeric Variables)
+
+```{r correlation}
+library(corrplot)
+
+num_vars <- df %>%
+  select(bid, bidtime, bidderrate, openbid, price) %>%
+  cor(use = "complete.obs")
+
+corrplot(num_vars,
+         method  = "color",
+         type    = "upper",
+         addCoef.col = "black",
+         tl.col  = "black",
+         tl.srt  = 45,
+         title   = "Correlation Matrix",
+         mar     = c(0, 0, 1, 0))
+```
+
+# 4. Summary Table
+
+```{r summary_table}
+# Per-auction summary combining everything
+full_summary <- df %>%
+  group_by(auctionid) %>%
+  summarise(
+    openbid       = first(openbid),
+    close_price   = first(price),
+    markup_pct_of_price    = round((first(price) - first(openbid)) / first(openbid) * 100, 1),
+    n_bids        = n(),
+    n_bidders     = n_distinct(bidder),
+    median_bid    = median(bid),
+    snipe_bids    = sum(bidtime > (7 - 1/24)),
+    avg_bidrate   = round(mean(bidderrate), 1),
+    .groups       = "drop"
+  )
+
+kable(full_summary,
+      col.names = c("Auction ID", "Open ($)", "Close ($)", "Markup (%)",
+                    "# Bids", "# Bidders", "Median Bid ($)",
+                    "Snipe Bids", "Avg Bidder Rating"),
+      caption = "Per-Auction Summary Statistics")
+```
